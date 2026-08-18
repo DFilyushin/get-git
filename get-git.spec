@@ -24,7 +24,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='get-git',
+    name='get-git-app',
     debug=False,
     strip=False,
     upx=False,

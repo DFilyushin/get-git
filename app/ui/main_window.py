@@ -28,9 +28,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.core import config as config_mod
+from app.core import git_ops
 from app.core.config import AppConfig, StateStore
 from app.core.gitlab_client import GitLabClient, Project
 from app.core.sync_manager import CANCELLED, ProjectListTask, RepoTask
+from app.ui.about_dialog import AboutDialog
 from app.ui.settings_dialog import SettingsDialog
 
 log = logging.getLogger(__name__)
@@ -78,6 +80,7 @@ class MainWindow(QMainWindow):
         self._total = 0
         self._done = 0
         self._errors = 0
+        self._running = False
 
         self._build_ui()
         self.append_log("Приложение запущено")
@@ -89,6 +92,10 @@ class MainWindow(QMainWindow):
     # ---------- UI ----------
 
     def _build_ui(self) -> None:
+        help_menu = self.menuBar().addMenu("Справка")
+        about_action = help_menu.addAction("О программе…")
+        about_action.triggered.connect(self._show_about)
+
         central = QWidget()
         layout = QVBoxLayout(central)
 
@@ -170,6 +177,10 @@ class MainWindow(QMainWindow):
             self._populate_table()
 
     @guarded
+    def _show_about(self) -> None:
+        AboutDialog(self).exec()
+
+    @guarded
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
         if dialog.exec():
@@ -249,6 +260,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, self._total)
         self.progress.setValue(0)
         self.progress.setVisible(True)
+        self._running = True
         self._set_busy(True)
         self.append_log(f"Начинаю обновление {self._total} репозиториев…")
 
@@ -274,6 +286,7 @@ class MainWindow(QMainWindow):
             self.append_log(f"ОШИБКА {name}: {message}")
         self._update_row(name)
         if self._done >= self._total:
+            self._running = False
             self._set_busy(False)
             self.progress.setVisible(False)
             summary = f"Готово: обновлено {self._done - self._errors}, ошибок {self._errors}"
@@ -286,6 +299,29 @@ class MainWindow(QMainWindow):
         self.cancel_event.set()
         self.cancel_btn.setEnabled(False)
         self.append_log("Отмена: ожидаю завершения уже запущенных операций…")
+
+    def closeEvent(self, event) -> None:
+        if self._running:
+            answer = QMessageBox.question(
+                self,
+                "Синхронизация не завершена",
+                "Идёт обновление репозиториев. Прервать и выйти?\n"
+                "Незавершённые операции будут остановлены.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self.shutdown()
+        event.accept()
+
+    def shutdown(self) -> bool:
+        """Останавливает фоновые задачи и git-процессы. True — пул завершился чисто."""
+        self.cancel_event.set()
+        self.pool.clear()  # снять с очереди ещё не начатые задачи
+        git_ops.terminate_all()
+        return self.pool.waitForDone(5000)
 
     def _set_busy(self, busy: bool) -> None:
         self.update_btn.setEnabled(not busy)

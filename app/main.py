@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
 import sys
 
 from PySide6.QtGui import QIcon
@@ -37,7 +39,16 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
-    return app.exec()
+    exit_code = app.exec()
+
+    # Страховка от зависшего в процессах приложения: если фоновые потоки
+    # не завершились за отведённое время — завершаем процесс принудительно
+    if not window.shutdown():
+        logging.getLogger(__name__).warning(
+            "Фоновые задачи не завершились за 5 с — принудительный выход"
+        )
+        os._exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -10,15 +10,47 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 600  # секунд на одну git-команду
 
+# Запущенные git-процессы: при выходе из приложения их нужно принудительно
+# завершить, иначе рабочие потоки (и весь процесс) зависают до таймаута
+_active_procs: set[subprocess.Popen] = set()
+_procs_lock = threading.Lock()
+
 
 class GitError(Exception):
     pass
+
+
+def terminate_all() -> int:
+    """Принудительно завершает все запущенные git-процессы. Возвращает их число."""
+    with _procs_lock:
+        procs = list(_active_procs)
+    for proc in procs:
+        _kill_tree(proc)
+    if procs:
+        log.warning("Принудительно завершено git-процессов: %d", len(procs))
+    return len(procs)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Завершает процесс вместе с потомками: дочерний ssh держит пайпы git,
+    и без него communicate() не разблокируется."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def find_git() -> str | None:
@@ -45,25 +77,34 @@ def run_git(
 ) -> str:
     cmd = ["git"] + list(args)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except FileNotFoundError as exc:
         raise GitError("git не найден в PATH") from exc
+    with _procs_lock:
+        _active_procs.add(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        _kill_tree(proc)
+        proc.communicate()
         raise GitError(f"git {args[0]}: превышен таймаут {timeout} с") from exc
+    finally:
+        with _procs_lock:
+            _active_procs.discard(proc)
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
+        detail = (stderr or stdout or "").strip() or "процесс прерван"
         raise GitError(f"git {args[0]}: {detail[-1000:]}")
-    return proc.stdout
+    return stdout
 
 
 def clone_repo(ssh_url: str, dest: Path, ssh_key_path: str | None) -> None:
