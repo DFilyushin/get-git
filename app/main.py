@@ -1,19 +1,29 @@
 """Точка входа Get-Git."""
 from __future__ import annotations
 
+import ctypes
 import sys
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.core import git_ops
 from app.logging_setup import setup_logging
+from app.resources import resource_path
 from app.ui.main_window import MainWindow
 
 
 def main() -> int:
     setup_logging()
+    if sys.platform == "win32":
+        # Собственный AppUserModelID: иначе при запуске из python.exe панель задач
+        # группирует окно под иконкой Python
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GetGit.App")
     app = QApplication(sys.argv)
     app.setApplicationName("Get-Git")
+    icon_file = resource_path("assets/get-git.ico")
+    if icon_file.is_file():
+        app.setWindowIcon(QIcon(str(icon_file)))
 
     if not git_ops.find_git():
         QMessageBox.critical(

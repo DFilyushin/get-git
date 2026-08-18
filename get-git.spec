@@ -5,7 +5,7 @@ a = Analysis(
     ['app/main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('assets/get-git.ico', 'assets')],
     hiddenimports=[
         'keyring.backends.Windows',
         'win32ctypes.core',
@@ -29,5 +29,5 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon=None,
+    icon='assets/get-git.ico',
 )
