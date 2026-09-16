@@ -1,4 +1,4 @@
-"""Главное окно: директория, список репозиториев, лог операций, прогресс."""
+"""Главное окно: источник, директория, список репозиториев, лог операций."""
 from __future__ import annotations
 
 import functools
@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -30,11 +31,11 @@ from PySide6.QtWidgets import (
 
 from app.core import config as config_mod
 from app.core import git_ops
-from app.core.config import AppConfig, StateStore
-from app.core.gitlab_client import GitLabClient, Project
+from app.core.provider import PROVIDER_TITLES, Project, make_client
+from app.core.storage import Database, Profile, SyncState, migrate_legacy
 from app.core.sync_manager import CANCELLED, ProjectListTask, RepoTask
 from app.ui.about_dialog import AboutDialog
-from app.ui.settings_dialog import SettingsDialog
+from app.ui.profiles_dialog import ProfilesDialog
 
 log = logging.getLogger(__name__)
 
@@ -64,20 +65,23 @@ def guarded(func):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, database: Database | None = None):
         super().__init__()
-        self.setWindowTitle("Get-Git — зеркала репозиториев GitLab")
-        self.resize(950, 680)
+        self.setWindowTitle("Get-Git — зеркала репозиториев GitLab/GitHub")
+        self.resize(980, 700)
 
-        self.config = AppConfig.load()
-        self.state = StateStore()
+        self.db = database or Database()
+        migrated = migrate_legacy(self.db)
+
+        self.profile: Profile | None = None
+        self.state: SyncState | None = None
         self.projects: list[Project] = []
         self.pool = QThreadPool(self)
-        self.pool.setMaxThreadCount(self.config.parallel_jobs)
         self.cancel_event = threading.Event()
         self._tasks: list = []  # ссылки на задачи, пока живы их сигналы
         self._row_items: dict[str, QTableWidgetItem] = {}
         self._projects_by_name: dict[str, Project] = {}
+        self._list_profile_id = ""  # источник, для которого запрошен список
         self._total = 0
         self._done = 0
         self._errors = 0
@@ -85,10 +89,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.append_log("Приложение запущено")
-        if self.config.gitlab_url and config_mod.get_token():
-            self.refresh_list()
-        else:
-            self.append_log("Задайте адрес GitLab и токен в «Настройки…»")
+        if migrated:
+            self.append_log(
+                "Настройки перенесены из config.json в базу данных (getgit.db)"
+            )
+        self._reload_profiles(self.db.get_setting("active_profile"))
 
     # ---------- UI ----------
 
@@ -100,17 +105,24 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
 
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Источник:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        source_row.addWidget(self.profile_combo, 1)
+        self.profiles_btn = QPushButton("Источники…")
+        self.profiles_btn.clicked.connect(self._open_profiles)
+        source_row.addWidget(self.profiles_btn)
+        layout.addLayout(source_row)
+
         top = QHBoxLayout()
         top.addWidget(QLabel("Директория:"))
-        self.dir_edit = QLineEdit(self.config.base_dir)
+        self.dir_edit = QLineEdit()
         self.dir_edit.editingFinished.connect(self._save_dir)
         top.addWidget(self.dir_edit, 1)
         browse_btn = QPushButton("Обзор…")
         browse_btn.clicked.connect(self._browse_dir)
         top.addWidget(browse_btn)
-        self.settings_btn = QPushButton("Настройки…")
-        self.settings_btn.clicked.connect(self._open_settings)
-        top.addWidget(self.settings_btn)
         layout.addLayout(top)
 
         buttons = QHBoxLayout()
@@ -127,9 +139,11 @@ class MainWindow(QMainWindow):
         buttons.addStretch(1)
         self.show_unavailable_cb = QCheckBox("Показывать недоступные репозитории")
         self.show_unavailable_cb.setToolTip(
-            "Репозитории, код которых недоступен вашей роли (нужна роль Reporter)"
+            "Репозитории, код которых недоступен вашей роли"
         )
-        self.show_unavailable_cb.setChecked(self.config.show_unavailable)
+        self.show_unavailable_cb.setChecked(
+            self.db.get_setting("show_unavailable", "1") == "1"
+        )
         self.show_unavailable_cb.toggled.connect(self._toggle_unavailable)
         buttons.addWidget(self.show_unavailable_cb)
         layout.addLayout(buttons)
@@ -167,6 +181,62 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(f"{datetime.now():%H:%M:%S}  {message}")
         log.info(message)
 
+    # ---------- источники ----------
+
+    def _reload_profiles(self, select_id: str = "") -> None:
+        profiles = self.db.profiles()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for profile in profiles:
+            title = PROVIDER_TITLES.get(profile.provider, profile.provider)
+            self.profile_combo.addItem(f"{profile.name} ({title})", profile.id)
+        index = max(self.profile_combo.findData(select_id), 0)
+        self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
+
+        if not profiles:
+            self.profile = None
+            self.state = None
+            self.projects = []
+            self.dir_edit.setText("")
+            self._populate_table()
+            self.append_log("Добавьте источник репозиториев — кнопка «Источники…»")
+            return
+        self._activate_profile(self.profile_combo.currentData())
+
+    def _activate_profile(self, profile_id: str) -> None:
+        profile = self.db.get_profile(profile_id)
+        if profile is None:
+            return
+        self.profile = profile
+        self.state = SyncState(self.db, profile.id)
+        self.pool.setMaxThreadCount(profile.parallel_jobs)
+        self.db.set_setting("active_profile", profile.id)
+        self.dir_edit.setText(profile.base_dir)
+        self.projects = []
+        self._populate_table()
+        if profile.api_url and config_mod.get_profile_token(profile.id):
+            self.refresh_list()
+        else:
+            self.append_log(
+                f"У источника «{profile.name}» не заданы адрес или токен — "
+                "откройте «Источники…»"
+            )
+
+    @guarded
+    def _on_profile_changed(self, index: int) -> None:
+        profile_id = self.profile_combo.itemData(index)
+        if profile_id:
+            self._activate_profile(profile_id)
+
+    @guarded
+    def _open_profiles(self) -> None:
+        dialog = ProfilesDialog(self.db, self)
+        dialog.exec()
+        if dialog.changed:
+            current = self.profile.id if self.profile else ""
+            self._reload_profiles(current)
+
     # ---------- действия ----------
 
     def _browse_dir(self) -> None:
@@ -178,50 +248,50 @@ class MainWindow(QMainWindow):
             self._save_dir()
 
     def _save_dir(self) -> None:
+        if self.profile is None:
+            return
         base_dir = self.dir_edit.text().strip()
-        if base_dir != self.config.base_dir:
-            self.config.base_dir = base_dir
-            self.config.save()
+        if base_dir != self.profile.base_dir:
+            self.profile.base_dir = base_dir
+            self.db.save_profile(self.profile)
             self._populate_table()
 
     @guarded
     def _toggle_unavailable(self, checked: bool) -> None:
-        self.config.show_unavailable = checked
-        self.config.save()
+        self.db.set_setting("show_unavailable", "1" if checked else "0")
         self._populate_table()
 
     @guarded
     def _show_about(self) -> None:
         AboutDialog(self).exec()
 
-    @guarded
-    def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.config, self)
-        if dialog.exec():
-            self.config.save()
-            self.pool.setMaxThreadCount(self.config.parallel_jobs)
-            self.append_log("Настройки сохранены")
-            self.refresh_list()
-
     def _open_in_explorer(self) -> None:
         row = self.table.currentRow()
-        if row < 0 or not self.config.base_dir:
+        base_dir = self.dir_edit.text().strip()
+        if row < 0 or not base_dir:
             return
         name = self.table.item(row, COL_REPO).data(Qt.ItemDataRole.UserRole)
-        dest = Path(self.config.base_dir) / Path(*name.split("/"))
+        dest = Path(base_dir) / Path(*name.split("/"))
         if dest.is_dir():
             os.startfile(dest)  # noqa: S606 — открытие локальной папки в Проводнике
 
     @guarded
     def refresh_list(self) -> None:
-        token = config_mod.get_token()
-        if not self.config.gitlab_url or not token:
-            self.append_log("Не задан адрес GitLab или токен — откройте «Настройки…»")
+        if self.profile is None:
+            self.append_log("Источник не выбран — откройте «Источники…»")
+            return
+        token = config_mod.get_profile_token(self.profile.id)
+        if not self.profile.api_url or not token:
+            self.append_log(
+                f"У источника «{self.profile.name}» не заданы адрес или токен — "
+                "откройте «Источники…»"
+            )
             return
         self.refresh_btn.setEnabled(False)
         self.statusBar().showMessage("Запрашиваю список репозиториев…")
-        self.append_log("Запрашиваю список репозиториев…")
-        task = ProjectListTask(GitLabClient(self.config.gitlab_url, token))
+        self.append_log(f"{self.profile.name}: запрашиваю список репозиториев…")
+        self._list_profile_id = self.profile.id
+        task = ProjectListTask(make_client(self.profile, token))
         task.signals.done.connect(self._on_projects)
         task.signals.failed.connect(self._on_projects_failed)
         self._tasks.append(task)
@@ -231,9 +301,11 @@ class MainWindow(QMainWindow):
     def _on_projects(self, projects: list[Project]) -> None:
         self.refresh_btn.setEnabled(True)
         self.statusBar().showMessage("Готово")
+        if self.profile is None or self.profile.id != self._list_profile_id:
+            return  # источник переключили, пока шёл запрос
         self.projects = projects
         no_access = sum(1 for p in projects if not p.can_download)
-        message = f"Доступно репозиториев: {len(projects)}"
+        message = f"{self.profile.name}: доступно репозиториев — {len(projects)}"
         if no_access:
             message += f" (из них без доступа к коду: {no_access})"
         self.append_log(message)
@@ -246,6 +318,9 @@ class MainWindow(QMainWindow):
 
     @guarded
     def update_all(self) -> None:
+        if self.profile is None:
+            self.append_log("Источник не выбран — откройте «Источники…»")
+            return
         if not self.projects:
             self.append_log("Список репозиториев пуст — нажмите «Обновить список»")
             return
@@ -256,14 +331,13 @@ class MainWindow(QMainWindow):
         available = [p for p in self.projects if p.can_download]
         skipped = len(self.projects) - len(available)
         if skipped:
-            self.append_log(
-                f"Пропущено репозиториев без доступа к коду (нужна роль Reporter): {skipped}"
-            )
+            self.append_log(f"Пропущено репозиториев без доступа к коду: {skipped}")
         if not available:
             self.append_log("Нет ни одного репозитория, доступного для скачивания")
             return
-        self.config.base_dir = base_dir
-        self.config.save()
+        if base_dir != self.profile.base_dir:
+            self.profile.base_dir = base_dir
+            self.db.save_profile(self.profile)
         Path(base_dir).mkdir(parents=True, exist_ok=True)
 
         self.cancel_event.clear()
@@ -276,10 +350,14 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self._running = True
         self._set_busy(True)
-        self.append_log(f"Начинаю обновление {self._total} репозиториев…")
+        self.append_log(
+            f"{self.profile.name}: начинаю обновление {self._total} репозиториев…"
+        )
 
         for project in available:
-            task = RepoTask(project, base_dir, self.config.ssh_key_path, self.cancel_event)
+            task = RepoTask(
+                project, base_dir, self.profile.ssh_key_path, self.cancel_event
+            )
             task.signals.log.connect(self.append_log)
             task.signals.finished.connect(self._on_repo_done)
             self._tasks.append(task)
@@ -290,13 +368,15 @@ class MainWindow(QMainWindow):
         self._done += 1
         self.progress.setValue(self._done)
         if ok:
-            self.state.record(name, True, message)
+            if self.state is not None:
+                self.state.record(name, True, message)
             self.append_log(f"{name}: {message}")
         elif message == CANCELLED:
             self.append_log(f"{name}: {CANCELLED}")
         else:
             self._errors += 1
-            self.state.record(name, False, f"ошибка: {message}")
+            if self.state is not None:
+                self.state.record(name, False, f"ошибка: {message}")
             self.append_log(f"ОШИБКА {name}: {message}")
         self._update_row(name)
         if self._done >= self._total:
@@ -340,17 +420,16 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self.update_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
-        self.settings_btn.setEnabled(not busy)
+        self.profiles_btn.setEnabled(not busy)
+        self.profile_combo.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
         self.statusBar().showMessage("Синхронизация…" if busy else "Готово")
 
     # ---------- таблица ----------
 
     def _populate_table(self) -> None:
-        visible = [
-            p for p in self.projects
-            if p.can_download or self.config.show_unavailable
-        ]
+        show_unavailable = self.show_unavailable_cb.isChecked()
+        visible = [p for p in self.projects if p.can_download or show_unavailable]
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(visible))
         self._row_items = {}
@@ -375,15 +454,18 @@ class MainWindow(QMainWindow):
         if repo_item is None:
             return
         row = repo_item.row()
+        base_dir = self.dir_edit.text().strip()
         local = False
-        if self.config.base_dir:
-            dest = Path(self.config.base_dir) / Path(*name.split("/"))
+        if base_dir:
+            dest = Path(base_dir) / Path(*name.split("/"))
             local = (dest / ".git").is_dir()
         self.table.item(row, COL_LOCAL).setText("✔" if local else "нет")
-        last = self.state.last_sync(name)
+        last = self.state.last_sync(name) if self.state else None
         self.table.item(row, COL_UPDATED).setText(last.strftime(DATE_FORMAT) if last else "—")
         project = self._projects_by_name.get(name)
         if project is not None and not project.can_download:
             self.table.item(row, COL_STATUS).setText(NO_ACCESS)
         else:
-            self.table.item(row, COL_STATUS).setText(self.state.last_result(name))
+            self.table.item(row, COL_STATUS).setText(
+                self.state.last_result(name) if self.state else ""
+            )
