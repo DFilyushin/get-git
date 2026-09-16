@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -30,6 +31,21 @@ _URL_HINTS = {
 _TOKEN_HINTS = {
     PROVIDER_GITLAB: "personal access token c правом read_api",
     PROVIDER_GITHUB: "personal access token co scope repo",
+}
+_TOKEN_TOOLTIPS = {
+    PROVIDER_GITLAB: (
+        "Токен нужен для получения списка доступных репозиториев\n"
+        "(код скачивается по SSH-ключу).\n\n"
+        "GitLab → Settings → Access Tokens → Add new token:\n"
+        "достаточно права read_api."
+    ),
+    PROVIDER_GITHUB: (
+        "Токен нужен для получения списка доступных репозиториев\n"
+        "(код скачивается по SSH-ключу).\n\n"
+        "GitHub → Settings → Developer settings → Personal access tokens:\n"
+        "classic token со scope repo, либо fine-grained с правом Metadata: Read.\n"
+        "В организациях с SAML SSO токен нужно авторизовать для организации."
+    ),
 }
 
 
@@ -66,6 +82,11 @@ class ProfileDialog(QDialog):
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("Access token:", self.token_edit)
 
+        self.token_help = QLabel()
+        self.token_help.setOpenExternalLinks(True)
+        self.token_help.setStyleSheet("font-size: 11px;")
+        form.addRow("", self.token_help)
+
         self.dir_edit = QLineEdit(self.profile.base_dir)
         dir_browse = QPushButton("Обзор…")
         dir_browse.clicked.connect(self._browse_dir)
@@ -94,6 +115,7 @@ class ProfileDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+        self.url_edit.textChanged.connect(self._update_token_help)
         self._on_provider_changed()
 
     def _current_provider(self) -> str:
@@ -105,6 +127,29 @@ class ProfileDialog(QDialog):
         self.token_edit.setPlaceholderText(_TOKEN_HINTS[provider])
         if provider == PROVIDER_GITHUB and not self.url_edit.text().strip():
             self.url_edit.setText(GITHUB_API_URL)
+        self._update_token_help()
+
+    def _token_settings_url(self) -> str:
+        """Страница создания токена на сервере, указанном в форме."""
+        provider = self._current_provider()
+        url = self.url_edit.text().strip() or _URL_HINTS[provider]
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        url = url.rstrip("/")
+        if provider == PROVIDER_GITHUB:
+            host = url.removesuffix("/api/v3")  # GitHub Enterprise
+            if host == "https://api.github.com":
+                host = "https://github.com"
+            return f"{host}/settings/tokens"
+        return f"{url}/-/user_settings/personal_access_tokens"
+
+    def _update_token_help(self) -> None:
+        provider = self._current_provider()
+        self.token_help.setText(
+            f'<a href="{self._token_settings_url()}">Где получить токен?</a>'
+        )
+        self.token_help.setToolTip(_TOKEN_TOOLTIPS[provider])
+        self.token_edit.setToolTip(_TOKEN_TOOLTIPS[provider])
 
     def _browse_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
