@@ -87,6 +87,21 @@ def test_sync_discards_local_changes_and_untracked(origin: Path, clone: Path):
     assert not (clone / "junk.tmp").exists()
 
 
+def test_sync_discards_local_commits_and_ignored_files(origin: Path, clone: Path):
+    # Локальный коммит поверх main и ignored-файл: зеркало должно убрать и то и другое
+    commit_file(origin, ".gitignore", "*.secret\n", "add gitignore")
+    git_ops.sync_repo(clone, "main", ssh_key_path=None)
+
+    commit_file(clone, "local.txt", "локальный коммит", "local commit")
+    (clone / "config.secret").write_text("ignored", encoding="utf-8")
+
+    git_ops.sync_repo(clone, "main", ssh_key_path=None)
+
+    assert not (clone / "local.txt").exists()
+    assert not (clone / "config.secret").exists()
+    assert head_of(clone, "main") == head_of(origin, "main")
+
+
 def test_sync_recovers_when_current_branch_deleted(origin: Path, clone: Path):
     run(["checkout", "-b", "temp"], origin)
     commit_file(origin, "t.txt", "t", "t")

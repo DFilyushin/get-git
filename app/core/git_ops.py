@@ -148,7 +148,8 @@ def sync_repo(dest: Path, default_branch: str, ssh_key_path: str | None) -> str:
         if branch != current:
             run_git(["branch", "-D", branch], cwd=dest, env=env)
 
-    run_git(["clean", "-fd"], cwd=dest, env=env)
+    # -x: удалять и ignored-файлы — локальная копия строго зеркалит сервер
+    run_git(["clean", "-fdx"], cwd=dest, env=env)
     return current
 
 
