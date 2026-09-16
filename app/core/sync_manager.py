@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.core import git_ops
-from app.core.gitlab_client import GitLabClient, GitLabError, Project
+from app.core.provider import Project, ProviderError
 
 CANCELLED = "отменено"
 
@@ -18,7 +18,7 @@ class ListSignals(QObject):
 
 
 class ProjectListTask(QRunnable):
-    def __init__(self, client: GitLabClient):
+    def __init__(self, client):
         super().__init__()
         self.setAutoDelete(False)
         self.client = client
@@ -27,7 +27,7 @@ class ProjectListTask(QRunnable):
     def run(self) -> None:
         try:
             self.signals.done.emit(self.client.list_projects())
-        except GitLabError as exc:
+        except ProviderError as exc:
             self.signals.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001 — фоновая нить не должна падать молча
             self.signals.failed.emit(f"неожиданная ошибка: {exc}")

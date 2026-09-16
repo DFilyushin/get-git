@@ -1,27 +1,17 @@
 """Клиент REST API корпоративного GitLab (v4)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import requests
 
+from app.core.provider import Project, ProviderError
 
-class GitLabError(Exception):
+
+class GitLabError(ProviderError):
     pass
 
 
 # Скачивание кода приватного проекта требует роли Reporter (30 — Developer, 20 — Reporter)
 DOWNLOAD_ACCESS_LEVEL = 20
-
-
-@dataclass
-class Project:
-    id: int
-    name: str
-    path_with_namespace: str
-    ssh_url_to_repo: str
-    default_branch: str
-    can_download: bool = True
 
 
 class GitLabClient:
@@ -74,7 +64,7 @@ class GitLabClient:
             raise GitLabError(f"GitLab недоступен: {exc}") from exc
         if response.status_code in (401, 403):
             raise GitLabError(
-                "Токен недействителен или не имеет права read_api — проверьте «Настройки…»"
+                "Токен недействителен или не имеет права read_api — проверьте настройки источника"
             )
         if response.status_code >= 400:
             raise GitLabError(
