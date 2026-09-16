@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -124,6 +125,13 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self._cancel)
         buttons.addWidget(self.cancel_btn)
         buttons.addStretch(1)
+        self.show_unavailable_cb = QCheckBox("Показывать недоступные репозитории")
+        self.show_unavailable_cb.setToolTip(
+            "Репозитории, код которых недоступен вашей роли (нужна роль Reporter)"
+        )
+        self.show_unavailable_cb.setChecked(self.config.show_unavailable)
+        self.show_unavailable_cb.toggled.connect(self._toggle_unavailable)
+        buttons.addWidget(self.show_unavailable_cb)
         layout.addLayout(buttons)
 
         self.table = QTableWidget(0, 5)
@@ -175,6 +183,12 @@ class MainWindow(QMainWindow):
             self.config.base_dir = base_dir
             self.config.save()
             self._populate_table()
+
+    @guarded
+    def _toggle_unavailable(self, checked: bool) -> None:
+        self.config.show_unavailable = checked
+        self.config.save()
+        self._populate_table()
 
     @guarded
     def _show_about(self) -> None:
@@ -333,11 +347,15 @@ class MainWindow(QMainWindow):
     # ---------- таблица ----------
 
     def _populate_table(self) -> None:
+        visible = [
+            p for p in self.projects
+            if p.can_download or self.config.show_unavailable
+        ]
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self.projects))
+        self.table.setRowCount(len(visible))
         self._row_items = {}
         self._projects_by_name = {p.path_with_namespace: p for p in self.projects}
-        for row, project in enumerate(self.projects):
+        for row, project in enumerate(visible):
             namespace, _, short_name = project.path_with_namespace.rpartition("/")
             repo_item = QTableWidgetItem(short_name or project.path_with_namespace)
             repo_item.setData(Qt.ItemDataRole.UserRole, project.path_with_namespace)

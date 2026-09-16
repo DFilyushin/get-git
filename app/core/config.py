@@ -40,6 +40,7 @@ class AppConfig:
     gitlab_url: str = ""
     ssh_key_path: str = str(Path.home() / ".ssh" / "id_ed25519")
     parallel_jobs: int = 4
+    show_unavailable: bool = True
 
     @classmethod
     def load(cls) -> "AppConfig":
